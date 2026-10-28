@@ -1,0 +1,30 @@
+{
+  "model": {
+    "dim": 768,
+    "n_layers": 12,
+    "n_heads": 12,
+    "n_kv_heads": 8,
+    "head_dim": 64,
+    "vocab_size": 32768,
+    "max_seq_len": 1024,
+    "mlp_hidden": 2816,
+    "rope_base": 10000.0
+  },
+  "train": {
+    "batch_size": 8,
+    "grad_accum": 16,
+    "lr": 0.0006,
+    "weight_decay": 0.1,
+    "total_steps": 60000,
+    "warmup": 1000,
+    "save_every": 500,
+    "log_every": 50,
+    "seed": 1337
+  },
+  "_notes": {
+    "params": "~126.6M with tied embeddings (32k vocab)",
+    "effective_batch_tokens": "8 * 16 * 1024 = 131,072 tokens/step",
+    "total_tokens": "~7.9B seen over 60k steps (2.5B+ unique with repetition)",
+    "kaggle_fit": "batch 8 x 1024 on T4 16GB with bf16; grad_accum compensates quota"
+  }
+}

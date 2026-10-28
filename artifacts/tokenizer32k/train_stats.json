@@ -1,0 +1,13 @@
+{
+  "vocab_size": 32768,
+  "n_merges": 32510,
+  "specials": {
+    "<|doc|>": 32766,
+    "<|eos|>": 32767
+  },
+  "sample_chars": 167181928,
+  "sample_mb": 168.0,
+  "train_seconds": 200.2,
+  "probe_fertility_chars_per_token": 4.545,
+  "format": 2
+}

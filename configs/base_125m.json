@@ -22,7 +22,7 @@
     "seed": 1337
   },
   "_notes": {
-    "params": "~126.2M with tied embeddings (32k vocab)",
+    "params": "~121.9M actual with tied embeddings (32k vocab)",
     "effective_batch_tokens": "8 * 16 * 1024 = 131,072 tokens/step",
     "total_tokens": "~7.9B seen over 60k steps (2.5B+ unique with repetition)",
     "kaggle_fit": "batch 8 x 1024 on T4 16GB with bf16; grad_accum compensates quota"

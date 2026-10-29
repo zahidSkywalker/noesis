@@ -22,6 +22,9 @@ WORK = "/kaggle/working"
 RUN = os.path.join(WORK, "run")
 MAX_HOURS = 8.2  # Kaggle GPU sessions cap at 9h — exit clean before the wall
 
+# v7 OOM lesson: reduce fragmentation pressure on the 14.5GB T4
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 t0 = time.time()
 os.makedirs(RUN, exist_ok=True)
 

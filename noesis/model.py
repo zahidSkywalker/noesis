@@ -120,14 +120,25 @@ class Attention(nn.Module):
             v = v.repeat_interleave(rep, dim=1)
 
         Tkv = k.shape[-2]
-        y = torch.matmul(q, k.transpose(-2, -1)) * self.scale             # [B,H,T,Tkv]
-        # causal mask in GLOBAL positions: query at pos (Tkv-T+t) attends j <= (Tkv-T+t)
-        q_pos = torch.arange(Tkv - T, Tkv, device=x.device)
-        k_pos = torch.arange(Tkv, device=x.device)
-        causal = k_pos[None, :] <= q_pos[:, None]                         # [T, Tkv]
-        y = y.masked_fill(~causal, float("-inf"))
-        y = F.softmax(y, dim=-1)
-        y = torch.matmul(y, v)                                            # [B,H,T,hd]
+        cache_empty = cache is None or cache[0] is None or not cache[0].numel()
+        if T == Tkv and cache_empty:
+            # Training / full-context path: fused scaled-dot-product attention.
+            # Never materializes the [B,H,T,T] score matrix — ~50x less attention
+            # memory and faster on GPU. (v7 OOM lesson: naive matmul + softmax +
+            # masked_fill peaked ~0.8 GiB/layer and killed the 14.5GB T4 at
+            # batch 8 x seq 1024.) is_causal=True == global-position causal
+            # when the sequence is square and un-offset.
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True,
+                                               scale=self.scale)
+        else:
+            # Decode path (KV-cache, T < Tkv): manual attention, causal mask in
+            # GLOBAL positions — query at pos (Tkv-T+t) attends j <= (Tkv-T+t).
+            y = torch.matmul(q, k.transpose(-2, -1)) * self.scale             # [B,H,T,Tkv]
+            q_pos = torch.arange(Tkv - T, Tkv, device=x.device)
+            k_pos = torch.arange(Tkv, device=x.device)
+            causal = k_pos[None, :] <= q_pos[:, None]                         # [T, Tkv]
+            y = y.masked_fill(~causal, float("-inf"))
+            y = torch.matmul(F.softmax(y, dim=-1), v)                         # [B,H,T,hd]
         y = y.transpose(1, 2).reshape(B, T, self.n_heads * self.hd)
         return self.o(y)
 

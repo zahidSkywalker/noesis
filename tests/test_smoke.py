@@ -121,6 +121,23 @@ def test_kv_cache_matches_full_recompute():
     assert torch.equal(seq, seq2), "KV-cache path must match full recompute exactly"
 
 
+def test_sdpa_matches_manual_attention():
+    """v7 OOM fix: training now uses fused SDPA; decode keeps manual
+    global-causal attention. Both paths must agree on identical tokens."""
+    torch.manual_seed(1)
+    cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, head_dim=16,
+                      vocab_size=512, max_seq_len=64, mlp_hidden=128)
+    model = NoesisModel(cfg).eval()
+    x = torch.randint(0, 512, (1, 12))
+    with torch.no_grad():
+        full, _ = model(x)                       # SDPA path (no cache)
+        caches = model.init_caches(1, "cpu")
+        model(x[:, :5], caches=caches)           # warm cache on prefix
+        cont, _ = model(x[:, 5:], caches=caches)  # manual path continuation
+    assert torch.allclose(full[:, 5:], cont, atol=1e-4), \
+        "SDPA and manual attention paths must agree on the same tokens"
+
+
 def test_checkpoint_resume():
     cfg = ModelConfig(dim=48, n_layers=2, n_heads=4, n_kv_heads=2, head_dim=12,
                       vocab_size=400, max_seq_len=32, mlp_hidden=96)

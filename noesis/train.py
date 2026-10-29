@@ -3,7 +3,8 @@
 Features:
   - AdamW + cosine schedule with warmup + gradient clipping
   - gradient accumulation (effective batch > memory batch)
-  - bf16 autocast on GPU, fp32 on CPU
+  - AMP: config train.amp = "fp16" | "bf16" on CUDA (fp16 + GradScaler for T4),
+    absent => plain fp32 (CPU/QA path unchanged)
   - checkpoints: model + optimizer + scheduler + step + config
     (a "cold" checkpoint alone is NOT enough to resume — we save it all)
   - resume: load latest checkpoint and continue exactly
@@ -59,8 +60,11 @@ def main():
     ap.add_argument("--tokenizer", required=True, help="vocab.json")
     ap.add_argument("--out", required=True, help="output run dir")
     ap.add_argument("--resume", action="store_true", help="resume from latest checkpoint in --out")
+    ap.add_argument("--max-hours", type=float, default=0.0,
+                    help="clean self-exit after N hours: checkpoint, then stop (0 = run to total_steps)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    t_session = time.time()
 
     os.makedirs(args.out, exist_ok=True)
     with open(args.config, encoding="utf-8") as f:
@@ -91,6 +95,15 @@ def main():
     log_every = tcfg.get("log_every", 50)
     ckpt_path = os.path.join(args.out, "latest.pt")
 
+    amp = tcfg.get("amp")
+    use_amp = bool(amp) and device == "cuda"
+    amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp)
+    if amp and amp_dtype is None:
+        raise SystemExit(f"[train] unknown train.amp: {amp!r} (use fp16|bf16)")
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp == "fp16" and device == "cuda"))
+    if amp:
+        print(f"[train] AMP: {amp} on {device} (scaler {'on' if scaler.is_enabled() else 'off'})")
+
     start_step, sched_step = 0, 0
     if args.resume and os.path.exists(ckpt_path):
         ckpt, _, model = load_checkpoint(ckpt_path, device)
@@ -103,6 +116,12 @@ def main():
     t0 = time.time()
     running = 0.0
     for step in range(start_step, total_steps):
+        if args.max_hours > 0 and (time.time() - t_session) > args.max_hours * 3600:
+            save_checkpoint(ckpt_path, model, optimizer, sched_step, mcfg.to_dict(),
+                            args.tokenizer, args.data, step)
+            print(f"[train] session time limit hit at step {step} — checkpoint saved, exiting clean")
+            break
+
         lr = cosine_lr(sched_step, total_steps, tcfg["lr"], warmup)
         for g in optimizer.param_groups:
             g["lr"] = lr
@@ -111,11 +130,14 @@ def main():
         loss_val = 0.0
         for _ in range(accum):
             x, y = stream.next_batch(device)
-            _, loss = model(x, targets=y)
-            (loss / accum).backward()
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                _, loss = model(x, targets=y)
+            scaler.scale(loss / accum).backward()
             loss_val += loss.item() / accum
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         sched_step += 1
         running += loss_val
 
@@ -132,6 +154,8 @@ def main():
             print(f"[train] checkpoint -> {ckpt_path} (step {step + 1})")
 
     print("[train] done.")
+    if args.max_hours > 0:
+        print(f"[train] session wall time: {(time.time() - t_session) / 3600:.2f}h")
 
 
 if __name__ == "__main__":

@@ -46,17 +46,20 @@ ds = find_one(f"{IN}/noesis-m4*")
 log(f"dataset dir: {ds} ({os.listdir(ds)})")
 
 # dataset parts may arrive as subdirs (dir-mode skip) or .zip bundles (dir-mode zip)
+# scan EVERY input mount, not just the corpus dataset — lets a small
+# "noesis-code" dataset hot-swap the code without re-uploading 2.6GB of corpus
 TMP = "/kaggle/tmp"
 os.makedirs(TMP, exist_ok=True)
-for z in glob.glob(f"{ds}/*.zip"):
-    name = os.path.basename(z)[:-4]
-    dest = os.path.join(TMP, name)
-    if not os.path.exists(os.path.join(dest, ".unpacked")):
-        log(f"unzipping {name} -> {dest}")
-        os.makedirs(dest, exist_ok=True)
-        with zipfile.ZipFile(z) as zf:
-            zf.extractall(dest)
-        open(os.path.join(dest, ".unpacked"), "w").close()
+for mount in sorted(glob.glob(f"{IN}/*")):
+    for z in sorted(glob.glob(f"{mount}/*.zip")):
+        name = os.path.basename(z)[:-4]
+        dest = os.path.join(TMP, name)
+        if not os.path.exists(os.path.join(dest, ".unpacked")):
+            log(f"unzipping {os.path.basename(mount)}/{name} -> {dest}")
+            os.makedirs(dest, exist_ok=True)
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(dest)
+            open(os.path.join(dest, ".unpacked"), "w").close()
 log(f"tmp contents: {os.listdir(TMP)}")
 
 def part(name):
@@ -66,7 +69,12 @@ def part(name):
             return cand
     return None
 
-code_dir = part("noesis_code")
+hot = os.path.join(TMP, "code", "noesis_code")
+code_dir = hot if os.path.isdir(os.path.join(hot, "noesis")) else None
+if code_dir is not None:
+    log("code: using hot-swap noesis-code dataset")
+if code_dir is None:
+    code_dir = part("noesis_code")
 if code_dir is None:
     code_dir = find_one(f"{ds}/noesis_code*", required=False)
 if code_dir is None:
@@ -125,7 +133,8 @@ log(f"previous session output: {prev}")
 # ---------------------------------------------------------------- tokens.bin
 tokens = os.path.join(WORK, "tokens.bin")
 if prev and os.path.exists(os.path.join(prev, "tokens.bin")):
-    log("reusing tokens.bin from previous session output")
+    log(f"reusing tokens.bin from previous session output "
+        f"({os.path.getsize(os.path.join(prev, 'tokens.bin')):,} bytes)")
     if not os.path.exists(tokens):
         shutil.copy2(os.path.join(prev, "tokens.bin"), tokens)
 elif os.path.exists(tokens):

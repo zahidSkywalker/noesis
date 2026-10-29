@@ -72,6 +72,31 @@ def test_model_forward_backward():
     assert 100_000 < n < 2_000_000, f"nano model should be ~1M params, got {n}"
 
 
+def test_production_configs_forward_backward():
+    """Regression for the M4 launch bug: base_125m shipped n_kv_heads=8 under
+    n_heads=12 — 12//8==1 silently skipped the GQA repeat and the very first
+    GPU forward died with a matmul shape error. Every shipped config must
+    survive a real forward/backward pass before it goes near a GPU."""
+    import glob as _glob
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = sorted(_glob.glob(os.path.join(root, "configs", "base*.json")))
+    assert paths, "no production configs found"
+    for path in paths:
+        with open(path) as f:
+            full = json.load(f)
+        cfg = ModelConfig.from_dict(full["model"])
+        assert cfg.n_heads % cfg.n_kv_heads == 0, \
+            f"{path}: invalid GQA ratio {cfg.n_heads}/{cfg.n_kv_heads}"
+        model = NoesisModel(cfg)
+        x = torch.randint(0, cfg.vocab_size, (1, 32))
+        logits, loss = model(x, targets=x)
+        assert logits.shape == (1, 32, cfg.vocab_size)
+        assert torch.isfinite(loss), f"{path}: non-finite loss"
+        loss.backward()
+        n = sum(p.numel() for p in model.parameters())
+        assert 100_000_000 < n < 200_000_000, f"{path}: expected ~125M params, got {n}"
+
+
 def test_kv_cache_matches_full_recompute():
     torch.manual_seed(0)
     cfg = ModelConfig(dim=64, n_layers=2, n_heads=4, n_kv_heads=2, head_dim=16,

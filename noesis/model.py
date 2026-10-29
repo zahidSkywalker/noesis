@@ -24,7 +24,7 @@ class ModelConfig:
     dim: int = 768
     n_layers: int = 12
     n_heads: int = 12          # query heads
-    n_kv_heads: int = 8        # key/value heads (GQA; == n_heads -> classic MHA)
+    n_kv_heads: int = 4        # key/value heads (GQA; == n_heads -> classic MHA)
     head_dim: int = 64
     vocab_size: int = 32768
     max_seq_len: int = 1024
@@ -86,6 +86,10 @@ class Attention(nn.Module):
         super().__init__()
         self.n_heads = cfg.n_heads
         self.n_kv = cfg.n_kv_heads
+        if self.n_heads % self.n_kv != 0:
+            raise ValueError(
+                f"GQA requires n_heads % n_kv_heads == 0, "
+                f"got {self.n_heads}/{self.n_kv} (ratio must be a whole number)")
         self.hd = cfg.head_dim
         self.q = nn.Linear(cfg.dim, cfg.n_heads * self.hd, bias=False)
         self.k = nn.Linear(cfg.dim, cfg.n_kv_heads * self.hd, bias=False)

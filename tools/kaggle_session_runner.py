@@ -9,6 +9,8 @@ After the session, /kaggle/working (tokens.bin + run/latest.pt) becomes this
 version's Output; the next push chains it as input again.
 """
 import glob
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -69,10 +71,39 @@ def part(name):
             return cand
     return None
 
-hot = os.path.join(TMP, "code", "noesis_code")
-code_dir = hot if os.path.isdir(os.path.join(hot, "noesis")) else None
+
+def find_hot_code():
+    """Locate the FIXED code in the noesis-code dataset mount.
+
+    Kaggle extracts uploaded .zip archives at STORE time, so the code arrives
+    as plain files (v6 lesson: TMP stayed empty and the runner fell back to
+    the stale noesis-m4 copy). Walk the code mount a few levels deep and
+    return the dir that directly contains the noesis package."""
+    mounts = sorted(glob.glob(f"{IN}/*"))
+    mounts.sort(key=lambda p: 0 if (
+        "code" in os.path.basename(p).lower()
+        and "noesis-m4" not in os.path.basename(p).lower()) else 1)
+    for mount in mounts:
+        base = os.path.basename(mount).lower()
+        if "code" not in base or "noesis-m4" in base:
+            continue
+        for dirpath, dirnames, _files in os.walk(mount):
+            if dirpath[len(mount):].count(os.sep) > 3:
+                dirnames[:] = []
+                continue
+            if "noesis" in dirnames and os.path.isfile(os.path.join(dirpath, "noesis", "model.py")):
+                return dirpath
+    return None
+
+
+code_dir = find_hot_code()
 if code_dir is not None:
-    log("code: using hot-swap noesis-code dataset")
+    log(f"code: hot-swap noesis-code dataset -> {code_dir}")
+if code_dir is None:
+    hot = os.path.join(TMP, "code", "noesis_code")
+    code_dir = hot if os.path.isdir(os.path.join(hot, "noesis")) else None
+    if code_dir is not None:
+        log("code: using hot-swap noesis-code dataset (kept-as-zip)")
 if code_dir is None:
     code_dir = part("noesis_code")
 if code_dir is None:
@@ -92,6 +123,20 @@ for _ in range(3):
     else:
         break
 log(f"code dir: {code_dir}")
+
+# stamp: make stale-code runs IMPOSSIBLE to miss in the log
+try:
+    with open(os.path.join(code_dir, "noesis", "model.py"), "rb") as fh:
+        _md5 = hashlib.md5(fh.read()).hexdigest()[:10]
+    with open(os.path.join(code_dir, "configs", "base_125m_kaggle.json")) as fh:
+        _nkv = json.load(fh)["model"]["n_kv_heads"]
+    log(f"code stamp: model.py md5={_md5} n_kv_heads={_nkv}")
+    if _nkv != 4:
+        raise SystemExit("[k] FATAL: STALE CODE — n_kv_heads != 4, refusing to burn GPU time")
+except SystemExit:
+    raise
+except Exception as e:
+    log(f"code stamp failed (continuing): {e}")
 sys.path.insert(0, code_dir)
 os.chdir(code_dir)
 
@@ -169,6 +214,9 @@ cmd = [sys.executable, "-m", "noesis.train",
 log(f"train cmd: {' '.join(cmd)}")
 r = subprocess.run(cmd)
 log(f"train exit code: {r.returncode}")
+if r.returncode != 0:
+    # v5/v6 lesson: exiting 0 here made Kaggle report COMPLETE on crashes
+    sys.exit(r.returncode)
 
 # ---------------------------------------------------------------- report
 lp = os.path.join(RUN, "latest.pt")

@@ -156,6 +156,52 @@ def test_checkpoint_resume():
         assert torch.isfinite(loss)
 
 
+def test_resume_optimizer_binding():
+    """v9 resume crash regression: train.py built the optimizer BEFORE resume,
+    then load_checkpoint() rebinds `model` to a fresh object — backward filled
+    the new object's grads while the optimizer/scaler only saw the original
+    params (all grad=None) -> 'No inf checks were recorded for this optimizer'
+    on the very first scaler.step() after resume. The real sequence must load
+    weights into the LIVE model so grads land on optimizer-held tensors."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(dim=32, n_layers=1, n_heads=2, n_kv_heads=1, head_dim=16,
+                      vocab_size=64, max_seq_len=16, mlp_hidden=64)
+    model = NoesisModel(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)  # optimizer BEFORE resume
+    x = torch.randint(0, 64, (2, 16))
+    y = torch.randint(0, 64, (2, 16))
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "latest.pt")
+        save_checkpoint(p, model, opt, 3, cfg.to_dict(), "vocab.json", "data.bin", 3)
+        # the exact resume sequence now used by train.main():
+        ckpt = torch.load(p, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(ckpt["optimizer"])
+    # identity: every live param must be a tensor the optimizer actually holds
+    opt_ids = {id(q) for g in opt.param_groups for q in g["params"]}
+    assert all(id(q) in opt_ids for q in model.parameters()), \
+        "optimizer must reference the live model's parameters after resume"
+    # grads must flow into optimizer-held tensors
+    _, loss = model(x, targets=y)
+    loss.backward()
+    held = [q for g in opt.param_groups for q in g["params"]]
+    assert all(q.grad is not None for q in held), \
+        "backward must populate grads on optimizer-held params (No-inf-checks regression)"
+
+
+def test_train_resume_does_not_rebind_model():
+    """Source-level pin: train.main() must never call load_checkpoint() (it
+    returns a NEW model object -> orphans the optimizer) and must load the
+    checkpoint into the live model via model.load_state_dict."""
+    import inspect
+    from noesis import train
+    src = inspect.getsource(train.main)
+    assert "load_checkpoint(" not in src, \
+        "train.main must not use load_checkpoint() — it rebinds model and orphans the optimizer"
+    assert "model.load_state_dict(ckpt[\"model\"])" in src, \
+        "resume path must load weights into the live model object"
+
+
 def test_quantizer_shrinks():
     from noesis.quantize import quantize_tensor
     w = torch.randn(768, 2816)

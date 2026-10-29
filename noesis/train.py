@@ -46,6 +46,12 @@ def save_checkpoint(path: str, model, optimizer, scheduler_step, cfg_dict, token
 
 
 def load_checkpoint(path: str, device: str):
+    """Standalone loader for inspection/eval tooling.
+
+    WARNING: returns a NEW model object. Do NOT use this to resume training —
+    train.main() must torch.load + model.load_state_dict into the live model
+    instead, or the optimizer ends up bound to orphaned parameters.
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg = ModelConfig.from_dict(ckpt["cfg"])
     model = NoesisModel(cfg).to(device)
@@ -106,11 +112,23 @@ def main():
 
     start_step, sched_step = 0, 0
     if args.resume and os.path.exists(ckpt_path):
-        ckpt, _, model = load_checkpoint(ckpt_path, device)
+        # Resume must load weights into the SAME model object the optimizer was
+        # built on. Never rebind `model` here: a fresh object would take the
+        # backward grads while the optimizer keeps stepping orphaned tensors
+        # (GradScaler: "No inf checks were recorded for this optimizer").
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
         sched_step = ckpt["scheduler_step"]
         print(f"[train] resumed from step {start_step}")
+
+    # Identity guard: every live model parameter must be the exact tensor the
+    # optimizer holds. Cheap (a few hundred id lookups) and turns any future
+    # model/optimizer split into a loud FATAL before GPU money is burned.
+    opt_params = {id(p) for g in optimizer.param_groups for p in g["params"]}
+    if not all(id(p) in opt_params for p in model.parameters()):
+        raise SystemExit("[train] FATAL: optimizer does not reference the live model's parameters")
 
     model.train()
     t0 = time.time()

@@ -27,8 +27,11 @@ from noesis.tokenizer import BPETokenizer  # noqa: E402
 
 
 def read_shard_text(p: str) -> str:
-    """Tolerant gz read: a truncated shard (killed mid-write) yields its
-    salvageable prefix instead of crashing the whole binarization."""
+    """Tolerant shard read: .gz (with truncation salvage) or plain text.
+    Kaggle auto-decompresses .gz dataset uploads, so both forms occur."""
+    if not p.endswith(".gz"):
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read()
     data = bytearray()
     truncated = False
     try:

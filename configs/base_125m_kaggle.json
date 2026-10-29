@@ -11,8 +11,8 @@
     "rope_base": 10000.0
   },
   "train": {
-    "batch_size": 8,
-    "grad_accum": 16,
+    "batch_size": 4,
+    "grad_accum": 32,
     "lr": 0.0006,
     "weight_decay": 0.1,
     "total_steps": 36000,
@@ -23,10 +23,11 @@
     "amp": "fp16"
   },
   "_notes": {
-    "params": "~126.2M with tied embeddings (32k vocab)",
-    "effective_batch_tokens": "8 * 16 * 1024 = 131,072 tokens/step",
+    "params": "121.9M with tied embeddings (32k vocab), n_kv_heads=4",
+    "effective_batch_tokens": "4 * 32 * 1024 = 131,072 tokens/step (unchanged)",
+    "batch_note": "v7 OOM on T4 14.56GB at batch 8 (attention scores + 1GB fp32 logits). batch 4 x accum 32 halves peak activation memory, same math",
     "total_tokens": "~4.72B seen over 36k steps (~3 epochs of 1.56B unique corpus tokens)",
     "amp": "fp16 + GradScaler for Kaggle T4 (Turing has no fast bf16)",
-    "sessions": "resumable; use --max-hours 8.4 to exit clean before Kaggle's 9h GPU limit"
+    "sessions": "resumable; use --max-hours 8.2 to exit clean before Kaggle's 9h GPU limit"
   }
 }

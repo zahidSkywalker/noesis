@@ -10,6 +10,8 @@ Covers:
   6. quantizer: int8 payload ~4x smaller
   7. val split: train stream never samples the held-out tail, [val] evals
      fire in a real train.main() run, and PRE-val checkpoints resume clean
+  8. val split hardening: an eval that RAISES must not kill training —
+     session completes, model returns to train mode, best_val stays None
 """
 
 from __future__ import annotations
@@ -305,6 +307,72 @@ def test_val_eval_end_to_end_with_resume():
         assert "[val] step 6 val_loss" in r2.stdout, r2.stdout    # first loop eval
         ckpt2 = torch.load(os.path.join(d, "run", "latest.pt"), weights_only=False)
         assert isinstance(ckpt2["best_val"], float), "best_val must be established after resume"
+
+
+def test_val_eval_failure_does_not_kill_training():
+    """Val split guarantee #3 (the 'Dont break anything' clause): if a val
+    eval RAISES (OOM, device glitch...), the session must survive — eval is
+    skipped with a WARNING, the model goes back to train mode (proven by
+    training steps completing past an eval-mode-exploding forward), and the
+    checkpoint carries best_val=None instead of a poisoned value."""
+    import contextlib
+    import io
+    import noesis.model as model_mod
+    import noesis.train as train_mod
+
+    torch.manual_seed(7)
+    with tempfile.TemporaryDirectory() as d:
+        text_path = os.path.join(d, "corpus.txt")
+        with open(text_path, "w") as f:
+            f.write(SAMPLE)
+        tok = BPETokenizer.train(SAMPLE, vocab_size=400)
+        tok.save(os.path.join(d, "vocab.json"))
+        binarize(tok, [text_path], os.path.join(d, "tokens.bin"))
+        cfg = {
+            "model": {"dim": 48, "n_layers": 2, "n_heads": 4, "n_kv_heads": 2,
+                      "head_dim": 12, "vocab_size": tok.vocab_size,
+                      "max_seq_len": 64, "mlp_hidden": 96},
+            "train": {"batch_size": 2, "grad_accum": 1, "lr": 1e-3,
+                      "total_steps": 2, "warmup": 1, "save_every": 1,
+                      "log_every": 1, "seed": 1337,
+                      "val_frac": 0.3, "val_every": 1, "val_batches": 2},
+        }
+        cfg_path = os.path.join(d, "cfg.json")
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+
+        # any forward in eval mode explodes; train-mode forwards are untouched.
+        # run_val's finally:model.train() is therefore observable: if it were
+        # skipped after the first failure, every later train step would die too.
+        orig_forward = model_mod.NoesisModel.forward
+
+        def exploding_forward(self, *a, **k):
+            if not self.training:
+                raise RuntimeError("synthetic val failure")
+            return orig_forward(self, *a, **k)
+
+        model_mod.NoesisModel.forward = exploding_forward
+        old_argv = sys.argv
+        buf = io.StringIO()
+        try:
+            sys.argv = ["train", "--config", cfg_path,
+                        "--data", os.path.join(d, "tokens.bin"),
+                        "--tokenizer", os.path.join(d, "vocab.json"),
+                        "--out", os.path.join(d, "run")]
+            with contextlib.redirect_stdout(buf):
+                train_mod.main()  # must NOT raise despite 3 exploding evals
+        finally:
+            sys.argv = old_argv
+            model_mod.NoesisModel.forward = orig_forward
+
+        out = buf.getvalue()
+        assert "WARNING: eval raised RuntimeError" in out, out   # baseline + both periodic
+        assert "baseline eval failed" in out, out
+        assert out.count("eval failed — skipping, training continues") == 2, out
+        assert "[train] step 1/2" in out and "[train] step 2/2" in out, out  # train steps ran in train mode
+        ckpt = torch.load(os.path.join(d, "run", "latest.pt"), weights_only=False)
+        assert ckpt["best_val"] is None, "failed evals must not poison best_val"
+        assert ckpt["step"] == 2
 
 
 def test_quantizer_shrinks():

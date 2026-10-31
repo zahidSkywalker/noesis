@@ -159,22 +159,37 @@ def main():
 
     model.train()
 
-    def run_val() -> float:
-        """Fixed-window val loss (no grad, no RNG disturbance to the train stream)."""
-        model.eval()
-        tot = 0.0
-        with torch.no_grad():
-            for _ in range(val_batches):
-                x, y = val_stream.next_batch(device)
-                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    _, vloss = model(x, targets=y)
-                tot += vloss.item()
-        model.train()
-        return tot / val_batches
+    def run_val() -> float | None:
+        """Fixed-window val loss (no grad, no RNG disturbance to the train stream).
+
+        Defensive: ANY failure (OOM, device glitch, data hiccup) returns None
+        instead of raising — a broken eval must never kill a training session.
+        model.train() is restored in finally so a failed eval can't leave the
+        model silently in eval mode for the rest of the session.
+        """
+        try:
+            model.eval()
+            tot = 0.0
+            with torch.no_grad():
+                for _ in range(val_batches):
+                    x, y = val_stream.next_batch(device)
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                        _, vloss = model(x, targets=y)
+                    tot += vloss.item()
+            return tot / val_batches
+        except Exception as e:
+            print(f"[val] WARNING: eval raised {type(e).__name__}: {e}")
+            return None
+        finally:
+            model.train()
 
     if val_stream is not None:
-        best_val = run_val()
-        print(f"[val] step {start_step} val_loss {best_val:.4f} (baseline)")
+        v = run_val()
+        if v is None:
+            print("[val] baseline eval failed — training proceeds, periodic evals will retry")
+        else:
+            best_val = v
+            print(f"[val] step {start_step} val_loss {v:.4f} (baseline)")
 
     t0 = time.time()
     running = 0.0
@@ -213,8 +228,11 @@ def main():
 
         if val_stream is not None and (step + 1) % val_every == 0:
             v = run_val()
-            best_val = v if best_val is None else min(best_val, v)
-            print(f"[val] step {step + 1} val_loss {v:.4f} (best {best_val:.4f})")
+            if v is None:
+                print(f"[val] step {step + 1} eval failed — skipping, training continues")
+            else:
+                best_val = v if best_val is None else min(best_val, v)
+                print(f"[val] step {step + 1} val_loss {v:.4f} (best {best_val:.4f})")
 
         if (step + 1) % save_every == 0 or (step + 1) == total_steps:
             save_checkpoint(ckpt_path, model, optimizer, sched_step, mcfg.to_dict(),

@@ -20,7 +20,10 @@
     "save_every": 500,
     "log_every": 50,
     "seed": 1337,
-    "amp": "fp16"
+    "amp": "fp16",
+    "val_frac": 0.002,
+    "val_every": 500,
+    "val_batches": 16
   },
   "_notes": {
     "params": "121.9M with tied embeddings (32k vocab), n_kv_heads=4",
@@ -28,6 +31,7 @@
     "batch_note": "v7 OOM on T4 14.56GB at batch 8 (attention scores + 1GB fp32 logits). batch 4 x accum 32 halves peak activation memory, same math",
     "total_tokens": "~4.72B seen over 36k steps (~3 epochs of 1.56B unique corpus tokens)",
     "amp": "fp16 + GradScaler for Kaggle T4 (Turing has no fast bf16)",
+    "val": "last 0.2% of tokens (~3.2M) held out at SAMPLING time (tokens.bin untouched); fixed-seed eval of 16x4096 tok every 500 steps -> [val] step N val_loss lines; resume-safe (best_val rides in checkpoints; old checkpoints load as None)",
     "sessions": "resumable; use --max-hours 8.2 to exit clean before Kaggle's 9h GPU limit"
   }
 }

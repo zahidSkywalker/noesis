@@ -8,6 +8,8 @@ Covers:
   4. KV-cache consistency: cached generation == full-recompute greedy
   5. checkpoint save -> resume -> training continues without NaN
   6. quantizer: int8 payload ~4x smaller
+  7. val split: train stream never samples the held-out tail, [val] evals
+     fire in a real train.main() run, and PRE-val checkpoints resume clean
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import os
 import sys
 import tempfile
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -200,6 +203,108 @@ def test_train_resume_does_not_rebind_model():
         "train.main must not use load_checkpoint() — it rebinds model and orphans the optimizer"
     assert "model.load_state_dict(ckpt[\"model\"])" in src, \
         "resume path must load weights into the live model object"
+
+
+def test_val_region_isolation():
+    """Val split guarantee #1: the train stream must NEVER sample the held-out
+    tail, and the val stream must see ONLY the tail. Proven with a sentinel
+    token id that exists solely in the tail."""
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "tokens.bin")
+        n_train, n_val = 50_000, 2_000
+        arr = np.concatenate([
+            np.random.default_rng(0).integers(0, 1000, size=n_train),
+            np.full(n_val, 4095, dtype=np.int64),  # sentinel: tail only
+        ]).astype(np.uint16)
+        arr.tofile(p)
+        SEQ, BS = 64, 8
+        train = TokenStream(p, SEQ, BS, seed=1, end=n_train)
+        val = TokenStream(p, SEQ, BS, seed=2, start=n_train)
+        assert train.end == n_train and val.start == n_train
+        for _ in range(200):  # train stream: sentinel must never appear
+            x, y = train.next_batch()
+            assert (x < 4095).all() and (y < 4095).all(), "train stream leaked into val tail"
+        for _ in range(50):   # val stream: every position at/after the border
+            x, y = val.next_batch()
+            assert (x >= 4095).all() and (y >= 4095).all(), "val stream saw pre-border tokens"
+        # default args reproduce the original whole-file behavior exactly
+        full = TokenStream(p, SEQ, BS, seed=1)
+        assert full.start == 0 and full.end == n_train + n_val
+        # a region too small for even one window raises loudly, never mis-samples
+        try:
+            TokenStream(p, SEQ, BS, seed=3, start=n_train + n_val - 10)
+            raise AssertionError("tiny val region must raise ValueError")
+        except ValueError:
+            pass
+
+
+def test_val_eval_end_to_end_with_resume():
+    """Val split guarantee #2: a real train.main() run prints [val] baseline +
+    periodic lines, best_val rides in checkpoints, and a PRE-val checkpoint
+    (best_val=None, i.e. what v17 saves) resumes cleanly — the exact
+    v17 -> v18 upgrade path session 7 will take on the live run."""
+    import subprocess
+    torch.manual_seed(7)
+    with tempfile.TemporaryDirectory() as d:
+        text_path = os.path.join(d, "corpus.txt")
+        with open(text_path, "w") as f:
+            f.write(SAMPLE)
+        tok = BPETokenizer.train(SAMPLE, vocab_size=400)
+        tok.save(os.path.join(d, "vocab.json"))
+        n = binarize(tok, [text_path], os.path.join(d, "tokens.bin"))
+        assert n >= 512, f"tiny corpus too small: {n} tokens"
+
+        cfg = {
+            "model": {"dim": 48, "n_layers": 2, "n_heads": 4, "n_kv_heads": 2,
+                      "head_dim": 12, "vocab_size": tok.vocab_size,
+                      "max_seq_len": 64, "mlp_hidden": 96},
+            "train": {"batch_size": 2, "grad_accum": 1, "lr": 1e-3,
+                      "total_steps": 2, "warmup": 1, "save_every": 1,
+                      "log_every": 1, "seed": 1337,
+                      "val_frac": 0.3, "val_every": 1, "val_batches": 2},
+        }
+        cfg_path = os.path.join(d, "cfg.json")
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+
+        env = dict(os.environ, PYTHONPATH=
+                   os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        cmd = [sys.executable, "-m", "noesis.train", "--config", cfg_path,
+               "--data", os.path.join(d, "tokens.bin"),
+               "--tokenizer", os.path.join(d, "vocab.json"),
+               "--out", os.path.join(d, "run")]
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=900)
+        assert r.returncode == 0, f"val run failed:\n{r.stdout}\n{r.stderr}"
+        assert "val split: holding out last" in r.stdout, r.stdout
+        assert "[val] step 0 val_loss" in r.stdout, r.stdout      # baseline
+        assert "[val] step 1 val_loss" in r.stdout, r.stdout      # periodic
+        assert "[val] step 2 val_loss" in r.stdout, r.stdout
+        ckpt = torch.load(os.path.join(d, "run", "latest.pt"), weights_only=False)
+        assert isinstance(ckpt["best_val"], float) and math.isfinite(ckpt["best_val"])
+
+        # ---- resume from a PRE-val checkpoint (best_val=None, v17-era format)
+        mcfg = ModelConfig.from_dict(cfg["model"])
+        model = NoesisModel(mcfg)
+        # optimizer must mirror train.main()'s 2-group construction exactly
+        decay, no_decay = [], []
+        for n_, p_ in model.named_parameters():
+            (no_decay if (p_.ndim == 1 or "embed" in n_) else decay).append(p_)
+        opt = torch.optim.AdamW(
+            [{"params": decay, "weight_decay": 0.1},
+             {"params": no_decay, "weight_decay": 0.0}], lr=1e-3)
+        save_checkpoint(os.path.join(d, "run", "latest.pt"), model, opt, 5,
+                        cfg["model"], "vocab.json", "tokens.bin", 5)  # best_val=None
+        cfg["train"]["total_steps"] = 6
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f)
+        r2 = subprocess.run(cmd + ["--resume"], capture_output=True, text=True,
+                            env=env, timeout=900)
+        assert r2.returncode == 0, f"val resume failed:\n{r2.stdout}\n{r2.stderr}"
+        assert "resumed from step 5" in r2.stdout, r2.stdout
+        assert "[val] step 5 val_loss" in r2.stdout, r2.stdout    # baseline after resume
+        assert "[val] step 6 val_loss" in r2.stdout, r2.stdout    # first loop eval
+        ckpt2 = torch.load(os.path.join(d, "run", "latest.pt"), weights_only=False)
+        assert isinstance(ckpt2["best_val"], float), "best_val must be established after resume"
 
 
 def test_quantizer_shrinks():

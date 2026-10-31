@@ -20,7 +20,7 @@ import time
 
 import torch
 
-from .data import TokenStream
+from .data import TokenStream, token_count
 from .model import ModelConfig, NoesisModel
 
 
@@ -84,7 +84,32 @@ def main():
     print(f"[train] params: {sum(p.numel() for p in model.parameters()):,} | device: {device}")
     print(f"[train] config: {json.dumps(mcfg.to_dict())}")
 
-    stream = TokenStream(args.data, mcfg.max_seq_len, tcfg["batch_size"], seed=tcfg.get("seed", 1337))
+    # ---- val split (config-driven; val_frac absent/0.0 => exactly the old path)
+    # Held-out tail of tokens.bin, applied at SAMPLING time: tokens.bin itself
+    # stays byte-identical across sessions (kernel-output chaining relies on
+    # that). Train stream windows can never cross val_start; the val stream
+    # sees only the tail, from a fixed seed, so val_loss is comparable across
+    # evals AND across sessions.
+    seed = tcfg.get("seed", 1337)
+    val_frac = float(tcfg.get("val_frac", 0.0) or 0.0)
+    val_every = int(tcfg.get("val_every", 500))
+    val_batches = int(tcfg.get("val_batches", 16))
+    n_tokens = token_count(args.data)
+    val_start = int(n_tokens * (1.0 - val_frac)) if val_frac > 0 else n_tokens
+    use_val = val_frac > 0 and (n_tokens - val_start) >= mcfg.max_seq_len * 2
+    if val_frac > 0 and not use_val:
+        print(f"[train] WARNING: val region too small ({n_tokens - val_start:,} tokens "
+              f"for seq_len {mcfg.max_seq_len}) — val disabled, train sees everything")
+        val_start = n_tokens
+    stream = TokenStream(args.data, mcfg.max_seq_len, tcfg["batch_size"], seed=seed,
+                         end=val_start if use_val else None)
+    val_stream = None
+    if use_val:
+        val_stream = TokenStream(args.data, mcfg.max_seq_len, tcfg["batch_size"],
+                                 seed=seed + 1, start=val_start)
+        print(f"[train] val split: holding out last {n_tokens - val_start:,}/{n_tokens:,} "
+              f"tokens ({val_frac * 100:.2f}%) — eval every {val_every} steps, "
+              f"{val_batches} batches x {tcfg['batch_size'] * mcfg.max_seq_len:,} tok")
 
     decay, no_decay = [], []
     for n, p in model.named_parameters():
@@ -111,6 +136,7 @@ def main():
         print(f"[train] AMP: {amp} on {device} (scaler {'on' if scaler.is_enabled() else 'off'})")
 
     start_step, sched_step = 0, 0
+    best_val = None
     if args.resume and os.path.exists(ckpt_path):
         # Resume must load weights into the SAME model object the optimizer was
         # built on. Never rebind `model` here: a fresh object would take the
@@ -121,6 +147,7 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt["step"]
         sched_step = ckpt["scheduler_step"]
+        best_val = ckpt.get("best_val")  # None on pre-val checkpoints — fine
         print(f"[train] resumed from step {start_step}")
 
     # Identity guard: every live model parameter must be the exact tensor the
@@ -131,12 +158,30 @@ def main():
         raise SystemExit("[train] FATAL: optimizer does not reference the live model's parameters")
 
     model.train()
+
+    def run_val() -> float:
+        """Fixed-window val loss (no grad, no RNG disturbance to the train stream)."""
+        model.eval()
+        tot = 0.0
+        with torch.no_grad():
+            for _ in range(val_batches):
+                x, y = val_stream.next_batch(device)
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                    _, vloss = model(x, targets=y)
+                tot += vloss.item()
+        model.train()
+        return tot / val_batches
+
+    if val_stream is not None:
+        best_val = run_val()
+        print(f"[val] step {start_step} val_loss {best_val:.4f} (baseline)")
+
     t0 = time.time()
     running = 0.0
     for step in range(start_step, total_steps):
         if args.max_hours > 0 and (time.time() - t_session) > args.max_hours * 3600:
             save_checkpoint(ckpt_path, model, optimizer, sched_step, mcfg.to_dict(),
-                            args.tokenizer, args.data, step)
+                            args.tokenizer, args.data, step, best_val=best_val)
             print(f"[train] session time limit hit at step {step} — checkpoint saved, exiting clean")
             break
 
@@ -166,9 +211,14 @@ def main():
                   f"tok/s {toks / dt:,.0f} elapsed {dt:.0f}s")
             running, t0 = 0.0, time.time()
 
+        if val_stream is not None and (step + 1) % val_every == 0:
+            v = run_val()
+            best_val = v if best_val is None else min(best_val, v)
+            print(f"[val] step {step + 1} val_loss {v:.4f} (best {best_val:.4f})")
+
         if (step + 1) % save_every == 0 or (step + 1) == total_steps:
             save_checkpoint(ckpt_path, model, optimizer, sched_step, mcfg.to_dict(),
-                            args.tokenizer, args.data, step + 1)
+                            args.tokenizer, args.data, step + 1, best_val=best_val)
             print(f"[train] checkpoint -> {ckpt_path} (step {step + 1})")
 
     print("[train] done.")

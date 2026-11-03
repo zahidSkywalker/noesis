@@ -22,9 +22,9 @@
 4. **Inference Engine** — hand-rolled KV-cache generation + int8 quantizer (~150MB brain)
 5. **Sleep Cycle** — nightly self-training on conversations + feedback; eval gate; auto-rollback
 
-## Training discipline (Kaggle free tier)
+## Training discipline (single-T4 sessions)
 
-- Checkpoint every 500 steps: model + optimizer + scheduler + step -> Kaggle Datasets
+- Checkpoint every 500 steps: model + optimizer + scheduler + step -> versioned dataset snapshots
 - Sessions are disposable; progress is not
-- ~1.5–2.5 weeks of quota for the full ~2.5B-token education
+- Session budget: ~9h wall each, chained head-to-tail for the full ~2.5B-token education
 - bf16 autocast on T4; grad-accum 16x for effective batch 131k tokens
